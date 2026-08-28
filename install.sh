@@ -86,6 +86,50 @@ MAP_DNF=( [g++]="gcc-c++" [build-essential]="@development-tools" [golang]="golan
     [mono-devel]="mono-devel" [john]="john" )
 
 # ----------------------------------------------------------------------------
+# Extra host backends used by "brew" native mode to fill brew's gaps WITHOUT a
+# container: Flatpak (GUI apps), pipx (Python tools), go install, gem.
+# Keys are the Debian names; values are the installable reference per backend.
+# A tool appears in at most one of these; the resolver checks them in order and
+# falls back to brew for everything else.
+# ----------------------------------------------------------------------------
+declare -A FLATPAK_MAP PIPX_MAP GO_MAP GEM_MAP
+
+# Flathub app IDs — GUI tools brew doesn't carry
+FLATPAK_MAP=(
+    [geany]="org.geany.Geany" [codium]="com.vscodium.codium"
+    [dbeaver]="io.dbeaver.DBeaverCommunity" [meld]="org.gnome.Meld"
+    [sqlitebrowser]="org.sqlitebrowser.sqlitebrowser" [seahorse]="org.gnome.seahorse.Application"
+    [wireshark]="org.wireshark.Wireshark" [zaproxy]="org.zaproxy.ZAP"
+    [logseq]="com.logseq.Logseq" [onionshare]="org.onionshare.OnionShare"
+    [torbrowser-launcher]="org.torproject.torbrowser-launcher" [qtcreator]="io.qt.QtCreator"
+)
+# PyPI — installed with pipx (isolated CLI apps)
+PIPX_MAP=(
+    [sqlmap]="sqlmap" [theharvester]="theHarvester" [wafw00f]="wafw00f"
+    [recon-ng]="recon-ng" [autorecon]="autorecon" [instaloader]="instaloader"
+    [python3-shodan]="shodan" [mitmproxy]="mitmproxy" [xsser]="xsser"
+    [changeme]="changeme" [hashid]="hashID" [droopescan]="droopescan"
+    [commix]="git+https://github.com/commixproject/commix"
+    [sherlock]="git+https://github.com/sherlock-project/sherlock"
+    [netexec]="git+https://github.com/Pennyw0rth/NetExec"
+    [cloud-enum]="git+https://github.com/initstring/cloud_enum"
+    [emailharvester]="git+https://github.com/maldevel/EmailHarvester"
+    [brutespray]="brutespray"
+)
+# Go modules — installed with `go install`
+GO_MAP=(
+    [ffuf]="github.com/ffuf/ffuf/v2@latest"
+    [gobuster]="github.com/OJ/gobuster/v3@latest"
+    [goshs]="github.com/patrickhener/goshs@latest"
+    [chisel]="github.com/jpillora/chisel@latest"
+    [trufflehog]="github.com/trufflesecurity/trufflehog/v3@latest"
+)
+# RubyGems — installed with `gem install`
+GEM_MAP=(
+    [wpscan]="wpscan" [cewl]="cewl" [evil-winrm]="evil-winrm" [twofi]="twofi"
+)
+
+# ----------------------------------------------------------------------------
 # Globals
 # ----------------------------------------------------------------------------
 SUDO=""
@@ -103,8 +147,10 @@ Usage:
   ./install.sh [options]
 
 Options:
-  -d                Container mode: install everything in a ParrotOS distrobox
-                    (recommended on Fedora/Bazzite/macOS/immutable systems).
+                    In brew mode it also uses flatpak (GUI apps) + pipx/go/gem,
+                    all installed directly on the host (no container).
+  -d                Opt-in container mode: install the FULL Parrot toolset in a
+                    ParrotOS distrobox (only for the Parrot-only leftovers).
   -c CAT[,CAT...]   Install only the given categories (native mode).
   -m MGR            Force a package manager: brew|apt|dnf|rpm-ostree|pacman|zypper.
                     (Native mode auto-prefers brew when it is installed.)
@@ -179,7 +225,7 @@ resolve_name() {
     printf '%s' "$p"
 }
 
-# Install one package with this manager; returns 0 on success.
+# Install one package with the primary manager; returns 0 on success.
 install_one() {
     local name="$1"
     if [[ "$PKG_MGR" == "brew" ]]; then
@@ -189,6 +235,40 @@ install_one() {
     fi
     # shellcheck disable=SC2086
     $SUDO $INSTALL_CMD "$name" >/dev/null 2>&1
+}
+
+# --- Extra host backends (used to fill brew's gaps, no container) ------------
+have() { command -v "$1" >/dev/null 2>&1; }
+
+flathub_ready=0
+ensure_flathub() {
+    have flatpak || return 1
+    if [[ $flathub_ready -eq 0 ]]; then
+        flatpak remote-add --if-not-exists --user flathub \
+            https://flathub.org/repo/flathub.flatpakrepo >/dev/null 2>&1 || true
+        flathub_ready=1
+    fi
+    return 0
+}
+install_flatpak() { ensure_flathub && flatpak install -y --user --noninteractive flathub "$1" >/dev/null 2>&1; }
+install_pipx()    { have pipx && pipx install "$1" >/dev/null 2>&1; }
+install_go()      { have go   && go install "$1" >/dev/null 2>&1; }
+install_gem()     { have gem  && gem install --user-install "$1" >/dev/null 2>&1; }
+
+# Try the extra backends for a package. Echoes "backend:ref" and returns 0 on
+# success; returns 1 if the package isn't mapped to any extra backend.
+try_extra_backends() {
+    local p="$1"
+    if [[ -n "${GEM_MAP[$p]+x}" ]]; then
+        install_gem "${GEM_MAP[$p]}" && { printf 'gem'; return 0; }; return 2
+    elif [[ -n "${PIPX_MAP[$p]+x}" ]]; then
+        install_pipx "${PIPX_MAP[$p]}" && { printf 'pipx'; return 0; }; return 2
+    elif [[ -n "${GO_MAP[$p]+x}" ]]; then
+        install_go "${GO_MAP[$p]}" && { printf 'go'; return 0; }; return 2
+    elif [[ -n "${FLATPAK_MAP[$p]+x}" ]]; then
+        install_flatpak "${FLATPAK_MAP[$p]}" && { printf 'flatpak'; return 0; }; return 2
+    fi
+    return 1   # not mapped to an extra backend
 }
 
 # ----------------------------------------------------------------------------
@@ -203,35 +283,79 @@ native_update() {
 }
 
 native_install_category() {
-    local cat="$1" p resolved
+    local cat="$1" p resolved backend rc
     header "[$PKG_MGR] Category: $cat"
     for p in ${CATEGORIES[$cat]}; do
+        # In brew mode, prefer the curated host backends (flatpak/pipx/go/gem)
+        # for tools brew doesn't carry — still all on the host, no container.
+        if [[ "$PKG_MGR" == "brew" ]]; then
+            backend="$(try_extra_backends "$p")"; rc=$?
+            if [[ $rc -eq 0 ]]; then
+                ok "installed: $p (${backend})"; ((INSTALLED_COUNT++)); continue
+            elif [[ $rc -eq 2 ]]; then
+                # Mapped to a backend but it failed (or backend not installed).
+                err "failed via mapped backend: $p"; FAILED_PKGS+=("$p"); continue
+            fi
+            # rc == 1: not mapped -> fall through to brew below.
+        fi
+
         resolved="$(resolve_name "$p")"
         if [[ -z "$resolved" ]]; then
             warn "no $PKG_MGR equivalent: $p (skipped)"; FAILED_PKGS+=("$p"); continue
         fi
         if install_one "$resolved"; then
-            ok "installed: $p${resolved:+ ($resolved)}"; ((INSTALLED_COUNT++))
+            ok "installed: $p${resolved:+ ($resolved)} (brew)"; ((INSTALLED_COUNT++))
         else
             err "unavailable: $p"; FAILED_PKGS+=("$p")
         fi
     done
 }
 
+# For brew mode: report which extra host backends are present and offer to
+# install the missing ones via brew (all stay on the host, no container).
+brew_backends_preflight() {
+    local missing=()
+    have flatpak || missing+=("flatpak")
+    have pipx    || missing+=("pipx")
+    have go      || missing+=("go")
+    have gem     || missing+=("ruby")   # provides gem
+
+    header "Host backends (fills brew's gaps, no container)"
+    for b in flatpak pipx go gem; do
+        if have "$b"; then ok "found: $b"; else warn "missing: $b"; fi
+    done
+
+    [[ ${#missing[@]} -eq 0 ]] && return 0
+    log "Missing backends can be installed with brew: ${missing[*]}"
+    local ans="y"
+    if [[ $ASSUME_YES -ne 1 ]]; then
+        read -r -p "Install missing backends now via brew? [Y/n] " ans
+    fi
+    if [[ ! "$ans" =~ ^[nN] ]]; then
+        for b in "${missing[@]}"; do
+            log "brew install $b"
+            brew install "$b" >/dev/null 2>&1 && ok "installed backend: $b" \
+                || warn "could not install backend: $b (some tools will be skipped)"
+        done
+        hash -r 2>/dev/null || true
+    fi
+}
+
 run_native() {
     detect_pkg_mgr
     if [[ -z "$PKG_MGR" ]]; then
         err "No supported package manager found (apt/dnf/rpm-ostree/pacman/zypper/brew)."
-        err "On Bazzite/immutable systems, run with -d to use a ParrotOS distrobox."
         exit 1
     fi
     setup_privilege
     log "Package manager: ${C_BOLD}$PKG_MGR${C_RESET}"
 
-    if [[ "$PKG_MGR" != "apt" ]]; then
+    if [[ "$PKG_MGR" == "brew" ]]; then
+        log "Multi-backend host install: brew (CLI) + flatpak (GUI) + pipx/go/gem."
+        brew_backends_preflight
+    elif [[ "$PKG_MGR" != "apt" ]]; then
         warn "This is a Debian/Parrot toolset. Many packages have no native"
         warn "$PKG_MGR equivalent and will be reported as unavailable."
-        warn "For full coverage, re-run with: ${C_BOLD}./install.sh -d${C_RESET}"
     fi
 
     if [[ $ASSUME_YES -ne 1 ]]; then
@@ -325,11 +449,13 @@ print_summary() {
     if [[ ${#FAILED_PKGS[@]} -eq 0 ]]; then
         ok "No failures."
     else
-        warn "${#FAILED_PKGS[@]} package(s) unavailable on this platform:"
+        warn "${#FAILED_PKGS[@]} package(s) have no host install on this platform:"
         printf '    %s\n' "${FAILED_PKGS[@]}"
         echo
-        warn "Most of these are Parrot/Debian-only. For full coverage run:"
-        warn "  ${C_BOLD}./install.sh -d${C_RESET}   (ParrotOS distrobox)"
+        warn "These are genuinely Parrot/Debian-only (custom .deb packaging, no"
+        warn "brew/flatpak/pip/go/gem equivalent). Options for them:"
+        warn "  - install manually from each tool's upstream project, or"
+        warn "  - run them via a Parrot distrobox (opt-in): ${C_BOLD}./install.sh -d${C_RESET}"
     fi
 }
 
