@@ -106,6 +106,8 @@ Options:
   -d                Container mode: install everything in a ParrotOS distrobox
                     (recommended on Fedora/Bazzite/macOS/immutable systems).
   -c CAT[,CAT...]   Install only the given categories (native mode).
+  -m MGR            Force a package manager: brew|apt|dnf|rpm-ostree|pacman|zypper.
+                    (Native mode auto-prefers brew when it is installed.)
   -l                List categories and exit.
   -y                Assume yes; do not prompt.
   -h                Show this help.
@@ -118,22 +120,41 @@ EOF
 # ----------------------------------------------------------------------------
 # Package-manager detection
 # ----------------------------------------------------------------------------
+# Configure command strings for a named manager. Returns 1 if unknown/missing.
+set_mgr() {
+    case "$1" in
+        apt)        command -v apt-get   >/dev/null 2>&1 || return 1
+                    PKG_MGR="apt";        UPDATE_CMD="apt-get update"; INSTALL_CMD="apt-get install -y --no-install-recommends" ;;
+        dnf)        command -v dnf        >/dev/null 2>&1 || return 1
+                    PKG_MGR="dnf";        UPDATE_CMD="dnf -y makecache"; INSTALL_CMD="dnf install -y" ;;
+        rpm-ostree) command -v rpm-ostree>/dev/null 2>&1 || return 1
+                    PKG_MGR="rpm-ostree"; UPDATE_CMD=":"; INSTALL_CMD="rpm-ostree install -y --idempotent" ;;
+        pacman)     command -v pacman     >/dev/null 2>&1 || return 1
+                    PKG_MGR="pacman";     UPDATE_CMD="pacman -Sy"; INSTALL_CMD="pacman -S --needed --noconfirm" ;;
+        zypper)     command -v zypper     >/dev/null 2>&1 || return 1
+                    PKG_MGR="zypper";     UPDATE_CMD="zypper refresh"; INSTALL_CMD="zypper install -y" ;;
+        brew)       command -v brew       >/dev/null 2>&1 || return 1
+                    PKG_MGR="brew";       UPDATE_CMD="brew update"; INSTALL_CMD="brew install" ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
 detect_pkg_mgr() {
-    if command -v apt-get >/dev/null 2>&1; then
-        PKG_MGR="apt";   UPDATE_CMD="apt-get update"; INSTALL_CMD="apt-get install -y --no-install-recommends"
-    elif command -v dnf >/dev/null 2>&1; then
-        PKG_MGR="dnf";   UPDATE_CMD="dnf -y makecache"; INSTALL_CMD="dnf install -y"
-    elif command -v rpm-ostree >/dev/null 2>&1; then
-        PKG_MGR="rpm-ostree"; UPDATE_CMD=":"; INSTALL_CMD="rpm-ostree install -y --idempotent"
-    elif command -v pacman >/dev/null 2>&1; then
-        PKG_MGR="pacman"; UPDATE_CMD="pacman -Sy"; INSTALL_CMD="pacman -S --needed --noconfirm"
-    elif command -v zypper >/dev/null 2>&1; then
-        PKG_MGR="zypper"; UPDATE_CMD="zypper refresh"; INSTALL_CMD="zypper install -y"
-    elif command -v brew >/dev/null 2>&1; then
-        PKG_MGR="brew";  UPDATE_CMD="brew update"; INSTALL_CMD="brew install"
-    else
-        PKG_MGR=""
+    # Forced override wins (see -m).
+    if [[ -n "$FORCE_MGR" ]]; then
+        if ! set_mgr "$FORCE_MGR"; then
+            err "Requested package manager '$FORCE_MGR' is not available on this system."
+            exit 1
+        fi
+        return
     fi
+    # brew is a strong signal of user intent, so prefer it when installed;
+    # otherwise fall back to the native system manager.
+    for m in brew apt dnf rpm-ostree pacman zypper; do
+        if set_mgr "$m"; then return; fi
+    done
+    PKG_MGR=""
 }
 
 # Root handling — brew must NOT run as root; system managers need it.
@@ -315,10 +336,11 @@ print_summary() {
 # ----------------------------------------------------------------------------
 # Arg parsing + main
 # ----------------------------------------------------------------------------
-SELECTED=(); ASSUME_YES=0; MODE="native"
-while getopts ":dc:lyh" opt; do
+SELECTED=(); ASSUME_YES=0; MODE="native"; FORCE_MGR=""
+while getopts ":dc:m:lyh" opt; do
     case "$opt" in
         d) MODE="container" ;;
+        m) FORCE_MGR="$OPTARG" ;;
         c) IFS=',' read -r -a SELECTED <<< "$OPTARG" ;;
         l) for c in "${CATEGORY_ORDER[@]}"; do printf '%s\n' "$c"; done; exit 0 ;;
         y) ASSUME_YES=1 ;;
